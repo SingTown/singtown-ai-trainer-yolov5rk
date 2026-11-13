@@ -55,6 +55,9 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ env.REGISTRY_IMAGE }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          # ACR rejects the provenance attestation manifest ("unknown manifest class
+          # for application/vnd.oci.empty.v1+json"), which fails the copy to ACR.
+          provenance: false
 
       - name: Export digest
         run: |
