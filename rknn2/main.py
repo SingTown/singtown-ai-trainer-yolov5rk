@@ -8,7 +8,7 @@ def on_stdout_write(content: str):
     client.log(content, end="")
 
 @error_watcher()
-def on_error():
+def on_error(error_message: str):
     client.failed()
 
 from pathlib import Path
