@@ -1,7 +1,7 @@
 name: Build and Push Docker Image to ACR
 
-# A v* tag builds the image and pushes it to Aliyun ACR, where SingTown AI
-# pulls it from. Run it by hand (workflow_dispatch) to check that a branch
+# Pushing a v* tag builds the image and pushes it to Aliyun ACR, where SingTown
+# AI pulls it from. Run it by hand (workflow_dispatch) to check that a branch
 # still builds: that builds the image and pushes nothing.
 on:
   push:
@@ -25,22 +25,35 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      # persist-credentials: false keeps the job's GitHub token out of
+      # .git/config, so a Dockerfile that copies the checkout cannot put it in
+      # an image layer.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
+      # Only a pushed v* tag publishes. A manual run never does, even when it is
+      # started on a tag, so it cannot replace a released image.
       - name: Image tags
         id: tags
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
             version="${GITHUB_REF_NAME#v}"
+            # v1.2.3+build.5 is release 1.2.3: SemVer build metadata is not part
+            # of the version, and "+" is not allowed in an image tag.
+            version="${version%%+*}"
             tags="$ACR_IMAGE:$version"
-            # v1.2.3 is also published as 1.2
+            # v1.2.3 is also published as 1.2; a prerelease (v1.2.3-rc.1) is not
             if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               tags="$tags $ACR_IMAGE:${version%.*}"
             fi
+            publish=true
           else
             tags="$ACR_IMAGE:ci-$GITHUB_SHA"
+            publish=false
           fi
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
       - name: Runner disk and Docker
         run: |
@@ -57,7 +70,7 @@ jobs:
         run: docker buildx create --name "$BUILDER" --driver docker-container
 
       - name: Log in to ACR
-        if: github.ref_type == 'tag'
+        if: steps.tags.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
@@ -70,12 +83,13 @@ jobs:
       - name: Build and push
         env:
           TAGS: ${{ steps.tags.outputs.tags }}
+          PUBLISH: ${{ steps.tags.outputs.publish }}
         run: |
           tag_args=()
           for tag in $TAGS; do
             tag_args+=(-t "$tag")
           done
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
+          if [ "$PUBLISH" = true ]; then
             output=(--push)
           else
             output=(--output type=cacheonly)
