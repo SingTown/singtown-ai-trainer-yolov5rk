@@ -1,128 +1,88 @@
 name: Build and Push Docker Image to ACR
 
+# A v* tag builds the image and pushes it to Aliyun ACR, where SingTown AI
+# pulls it from. Run it by hand (workflow_dispatch) to check that a branch
+# still builds: that builds the image and pushes nothing.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  REGISTRY_IMAGE: ghcr.io/singtown/singtown-ai-trainer-yolov5rk
+  ACR_REGISTRY: registry.cn-shenzhen.aliyuncs.com
   ACR_IMAGE: registry.cn-shenzhen.aliyuncs.com/singtown-ai/singtown-ai-trainer-yolov5rk
 
 jobs:
-  build-amd64:
-    runs-on: ubuntu-latest
+  build:
+    # The image carries the CUDA libraries and is too big for a GitHub-hosted
+    # runner's disk, and the office network pushes to ACR much faster.
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 120
+
     steps:
-      - name: Free Disk Space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
+      - uses: actions/checkout@v4
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY_IMAGE }}
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          platforms: linux/amd64
-          labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ env.REGISTRY_IMAGE }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-          # ACR rejects the provenance attestation manifest ("unknown manifest class
-          # for application/vnd.oci.empty.v1+json"), which fails the copy to ACR.
-          provenance: false
-
-      - name: Export digest
+      - name: Image tags
+        id: tags
         run: |
-          mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            # v1.2.3 is published as 1.2.3 and as 1.2
+            echo "tags=$ACR_IMAGE:$version $ACR_IMAGE:${version%.*}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=$ACR_IMAGE:ci-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-linux-amd64
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    runs-on: ubuntu-latest
-    needs:
-      - build-amd64
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-*
-          merge-multiple: true
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v2
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY_IMAGE }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - name: Create manifest list and push GHCR
-        working-directory: ${{ runner.temp }}/digests
+      - name: Runner disk and Docker
         run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+          df -h / "$(docker info --format '{{.DockerRootDir}}')"
+          docker version --format 'docker {{.Server.Version}}'
+          docker buildx version || true
 
-      - name: Inspect image
+      # --pull --no-cache: the runner keeps its layer cache between runs, and a
+      # cached layer would silently reuse an old base image or an old
+      # clone of yolov5_rk.
+      #
+      # ACR rejects the provenance attestation manifest that buildx attaches by
+      # default ("unknown manifest class for application/vnd.oci.empty.v1+json").
+      - name: Build
+        env:
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}
+          tag_args=()
+          for tag in $TAGS; do
+            tag_args+=(-t "$tag")
+          done
+          docker build --pull --no-cache --platform linux/amd64 "${tag_args[@]}" .
 
-      - name: Install skopeo
-        run: sudo apt-get update && sudo apt-get install -y skopeo
+      - name: Log in to ACR
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Copy GHCR → ACR
+      - name: Push to ACR
+        if: github.ref_type == 'tag'
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
         run: |
-          skopeo copy --all \
-            docker://${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }} \
-            docker://${{ env.ACR_IMAGE }}:${{ steps.meta.outputs.version }} \
-            --src-creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            --dest-creds "${{ secrets.ACR_USERNAME }}:${{ secrets.ACR_PASSWORD }}"
+          for tag in $TAGS; do
+            docker push "$tag"
+          done
+
+      # The image is several GB; do not let every release pile up on the runner.
+      - name: Remove the image from the runner
+        if: always()
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            docker image rm "$tag" || true
+          done
