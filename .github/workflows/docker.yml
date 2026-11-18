@@ -15,6 +15,7 @@ permissions:
 env:
   ACR_REGISTRY: registry.cn-shenzhen.aliyuncs.com
   ACR_IMAGE: registry.cn-shenzhen.aliyuncs.com/singtown-ai/singtown-ai-trainer-yolov5rk
+  BUILDER: trainer-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   build:
@@ -31,34 +32,29 @@ jobs:
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version="${GITHUB_REF_NAME#v}"
-            # v1.2.3 is published as 1.2.3 and as 1.2
-            echo "tags=$ACR_IMAGE:$version $ACR_IMAGE:${version%.*}" >> "$GITHUB_OUTPUT"
+            tags="$ACR_IMAGE:$version"
+            # v1.2.3 is also published as 1.2
+            if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              tags="$tags $ACR_IMAGE:${version%.*}"
+            fi
           else
-            echo "tags=$ACR_IMAGE:ci-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            tags="$ACR_IMAGE:ci-$GITHUB_SHA"
           fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
       - name: Runner disk and Docker
         run: |
           df -h / "$(docker info --format '{{.DockerRootDir}}')"
           docker version --format 'docker {{.Server.Version}}'
-          docker buildx version || true
+          docker buildx version
 
-      # --pull --no-cache: the runner keeps its layer cache between runs, and a
-      # cached layer would silently reuse an old base image or an old
-      # clone of yolov5_rk.
-      #
-      # ACR rejects the provenance attestation manifest that buildx attaches by
-      # default ("unknown manifest class for application/vnd.oci.empty.v1+json").
-      - name: Build
-        env:
-          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
-          TAGS: ${{ steps.tags.outputs.tags }}
-        run: |
-          tag_args=()
-          for tag in $TAGS; do
-            tag_args+=(-t "$tag")
-          done
-          docker build --pull --no-cache --platform linux/amd64 "${tag_args[@]}" .
+      # A throwaway builder: one build leaves about 12 GB of cache, which is
+      # deleted with the builder at the end of the job instead of piling up on
+      # the shared runner. Starting empty also means the base image and the
+      # yolov5_rk clone
+      # can never come from a stale cached layer.
+      - name: Create the builder
+        run: docker buildx create --name "$BUILDER" --driver docker-container
 
       - name: Log in to ACR
         if: github.ref_type == 'tag'
@@ -68,21 +64,25 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Push to ACR
-        if: github.ref_type == 'tag'
+      # --provenance=false: ACR rejects the attestation manifest that buildx
+      # attaches by default ("unknown manifest class for
+      # application/vnd.oci.empty.v1+json").
+      - name: Build and push
         env:
           TAGS: ${{ steps.tags.outputs.tags }}
         run: |
+          tag_args=()
           for tag in $TAGS; do
-            docker push "$tag"
+            tag_args+=(-t "$tag")
           done
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            output=(--push)
+          else
+            output=(--output type=cacheonly)
+          fi
+          docker buildx build --builder "$BUILDER" --provenance=false \
+            --platform linux/amd64 "${tag_args[@]}" "${output[@]}" .
 
-      # The image is several GB; do not let every release pile up on the runner.
-      - name: Remove the image from the runner
+      - name: Remove the builder
         if: always()
-        env:
-          TAGS: ${{ steps.tags.outputs.tags }}
-        run: |
-          for tag in $TAGS; do
-            docker image rm "$tag" || true
-          done
+        run: docker buildx rm --force "$BUILDER" || true
